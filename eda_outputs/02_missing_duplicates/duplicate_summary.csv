@@ -1,0 +1,4 @@
+,metric,count
+0,dup_by_text_rows,5458
+1,dup_by_text_label_rows,5010
+2,conflict_text_count,240
