@@ -1,0 +1,10 @@
+<class 'pandas.core.frame.DataFrame'>
+RangeIndex: 24048 entries, 0 to 24047
+Data columns (total 3 columns):
+ #   Column     Non-Null Count  Dtype 
+---  ------     --------------  ----- 
+ 0   free_text  24046 non-null  object
+ 1   label_id   24048 non-null  int64 
+ 2   split      24048 non-null  object
+dtypes: int64(1), object(2)
+memory usage: 563.8+ KB

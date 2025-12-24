@@ -1,0 +1,4 @@
+split,vocab_size,jaccard_vs_train
+train,10682,1.0
+dev,3832,0.30686115613182063
+test,5815,0.39651231693896555
