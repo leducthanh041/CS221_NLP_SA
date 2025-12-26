@@ -1,5 +1,6 @@
 # app.py
 import time
+import json
 import joblib
 import numpy as np
 import pandas as pd
@@ -9,20 +10,23 @@ import plotly.graph_objects as go
 import requests
 
 from streamlit_lottie import st_lottie
+from sklearn.pipeline import Pipeline
 
-from utils import (
-    LABEL_ID_TO_NAME,
-    extract_parts,
-    get_confidence,
-    top_contributing_terms,
-    top_tfidf_terms,
-)
 
 # =========================
-# Page config + CSS
+# Config
 # =========================
-st.set_page_config(page_title="UIT-ViHSD Demo", layout="wide")
+st.set_page_config(page_title="UIT-ViHSD — TF-IDF + MultinomialNB Demo", layout="wide")
 
+MODEL_PATH = "final_best_mnb_tfidf.joblib"
+INFO_PATH = "final_best_mnb_tfidf_info.json"
+
+LABEL_ID_TO_NAME = {0: "CLEAN", 1: "OFFENSIVE", 2: "HATE"}
+
+
+# =========================
+# CSS (card + subtle animations)
+# =========================
 CSS = """
 <style>
 .block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
@@ -58,23 +62,6 @@ CSS = """
 """
 st.markdown(CSS, unsafe_allow_html=True)
 
-# =========================
-# Constants
-# =========================
-MODEL_PATH = "svm_best.joblib"
-RANDOM_STATE = 22
-
-# =========================
-# Session state (để UI không reset khi bấm các nút khác)
-# =========================
-if "analysis" not in st.session_state:
-    st.session_state.analysis = None
-if "did_predict" not in st.session_state:
-    st.session_state.did_predict = False
-if "last_text" not in st.session_state:
-    st.session_state.last_text = ""
-if "play_tokens" not in st.session_state:
-    st.session_state.play_tokens = False
 
 # =========================
 # Helpers
@@ -94,566 +81,817 @@ def label_badge_html(label_id: int, label_name: str):
     return f'<span class="badge {klass}">{label_name} ({label_id})</span>'
 
 
-def try_get_analyzer(vectorizer):
-    if vectorizer is None:
-        return None
-    if hasattr(vectorizer, "build_analyzer"):
-        try:
-            return vectorizer.build_analyzer()
-        except Exception:
-            return None
-    return None
+def softmax(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=float).reshape(-1)
+    x = x - np.max(x)
+    e = np.exp(x)
+    s = e.sum()
+    if s == 0 or not np.isfinite(s):
+        return np.ones_like(x) / max(1, x.size)
+    return e / s
 
 
-def compute_scores_from_coef(clf, X_vec):
+def safe_log(x, eps=1e-12):
+    return np.log(np.maximum(x, eps))
+
+
+def extract_vectorizer_and_nb(loaded):
     """
-    Tính score_k = w_k^T x + b_k bằng coef_ nếu có.
-    Trả về vector scores shape (n_classes,) hoặc None.
+    Support:
+      - Pipeline(tfidf, clf)
+      - dict contains pipeline/model/vectorizer/clf
+      - direct clf (rare)
+    Return: (pipeline_or_clf, vectorizer, clf)
     """
-    if clf is None or X_vec is None or (not hasattr(clf, "coef_")):
-        return None
+    vectorizer = None
+    clf = None
+    model = loaded
 
-    coef = np.asarray(clf.coef_)             # (K, D)
-    intercept = np.asarray(getattr(clf, "intercept_", np.zeros((coef.shape[0],), dtype=float)))
+    # unwrap dict
+    if isinstance(loaded, dict):
+        # pick pipeline/model/clf-like
+        for k in ["pipeline", "model", "estimator", "clf"]:
+            if k in loaded:
+                model = loaded[k]
+                break
+        # try vectorizer inside dict
+        for k in ["vectorizer", "tfidf", "tfidf_vectorizer"]:
+            if k in loaded:
+                vectorizer = loaded[k]
+                break
+        # try clf inside dict
+        for k in ["clf", "classifier", "mnb", "nb"]:
+            if k in loaded and hasattr(loaded[k], "predict"):
+                clf = loaded[k]
+                break
+
+    # pipeline
+    if isinstance(model, Pipeline):
+        # try typical step names
+        steps = dict(model.named_steps)
+        for k in ["tfidf", "vectorizer", "vect"]:
+            if k in steps:
+                vectorizer = steps[k]
+                break
+        # classifier
+        for k in ["clf", "classifier", "mnb", "nb"]:
+            if k in steps:
+                clf = steps[k]
+                break
+        # fallback: last step
+        if clf is None:
+            clf = model.steps[-1][1]
+        return model, vectorizer, clf
+
+    # not pipeline
+    if clf is None and hasattr(model, "predict"):
+        clf = model
+
+    return model, vectorizer, clf
+
+
+def tfidf_top_terms(vectorizer, x_vec_row, top_k=15):
+    """
+    x_vec_row: sparse row (1, n_features)
+    Return list of (term, tfidf_value)
+    """
+    if vectorizer is None or x_vec_row is None:
+        return []
     try:
-        scores_mat = (X_vec @ coef.T)        # (1, K)
-        scores = scores_mat.A1 if hasattr(scores_mat, "A1") else np.asarray(scores_mat).reshape(-1)
-        scores = scores + intercept.reshape(-1)
-        return scores
+        feat_names = vectorizer.get_feature_names_out()
+        row = x_vec_row.tocoo()
+        if row.nnz == 0:
+            return []
+        vals = row.data
+        idxs = row.col
+        order = np.argsort(vals)[::-1][: int(top_k)]
+        out = [(str(feat_names[idxs[i]]), float(vals[i])) for i in order]
+        return out
+    except Exception:
+        return []
+
+
+def nb_class_term_table(vectorizer, clf, class_index: int, top_k=25):
+    """
+    Show top terms by P(t|c) (equiv: highest feature_log_prob_ for class c).
+    Return dataframe columns: term, log_P_t_given_c, P_t_given_c
+    """
+    if vectorizer is None or clf is None:
+        return pd.DataFrame(columns=["term", "log_P_t_given_c", "P_t_given_c"])
+    if not hasattr(clf, "feature_log_prob_"):
+        return pd.DataFrame(columns=["term", "log_P_t_given_c", "P_t_given_c"])
+    try:
+        feat_names = vectorizer.get_feature_names_out()
+        logp = np.asarray(clf.feature_log_prob_)[class_index]  # (n_features,)
+        order = np.argsort(logp)[::-1][: int(top_k)]
+        terms = [str(feat_names[i]) for i in order]
+        logps = logp[order]
+        ps = np.exp(logps)
+        df = pd.DataFrame({"term": terms, "log_P_t_given_c": logps, "P_t_given_c": ps})
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["term", "log_P_t_given_c", "P_t_given_c"])
+
+
+def nb_explain_log_posterior(vectorizer, clf, x_vec_row, top_k=20):
+    """
+    Compute per-class:
+      log_prior[c]
+      log_likelihood[c] = sum_i x_i * log P(w_i|c)
+      log_posterior_unnorm[c] = log_prior + log_likelihood
+
+    Also return token-level contributions for each class:
+      contrib_i(c) = x_i * logP_i_c
+    but we only keep top tokens by |delta| or by contribution for predicted class.
+    """
+    if vectorizer is None or clf is None or x_vec_row is None:
+        return None
+
+    if not hasattr(clf, "feature_log_prob_") or not hasattr(clf, "class_log_prior_"):
+        return None
+
+    feat_log_prob = np.asarray(clf.feature_log_prob_)  # (C, V)
+    log_prior = np.asarray(clf.class_log_prior_)       # (C,)
+
+    # sparse row
+    row = x_vec_row.tocoo()
+    if row.nnz == 0:
+        # still can compute posterior = prior
+        C = int(log_prior.size)
+        log_like = np.zeros((C,), dtype=float)
+        log_post = log_prior + log_like
+        return {
+            "log_prior": log_prior,
+            "log_like": log_like,
+            "log_post": log_post,
+            "row": row,
+            "token_info": [],
+        }
+
+    idxs = row.col
+    vals = row.data  # TF-IDF weights (non-negative)
+
+    # compute per class log-likelihood
+    # log_like[c] = sum_j vals[j] * feat_log_prob[c, idxs[j]]
+    log_like = (feat_log_prob[:, idxs] * vals.reshape(1, -1)).sum(axis=1)
+    log_post = log_prior + log_like
+
+    # token-level table for predicted class (and deltas with runner-up)
+    try:
+        feat_names = vectorizer.get_feature_names_out()
+        tokens = [str(feat_names[i]) for i in idxs]
+    except Exception:
+        tokens = [str(i) for i in idxs]
+
+    token_info = []
+    for t, fid, v in zip(tokens, idxs, vals):
+        per_class = feat_log_prob[:, fid]  # (C,)
+        token_info.append(
+            {
+                "term": t,
+                "tfidf": float(v),
+                "logP_given_class": per_class.astype(float).tolist(),
+            }
+        )
+
+    return {
+        "log_prior": log_prior.astype(float),
+        "log_like": np.asarray(log_like, dtype=float),
+        "log_post": np.asarray(log_post, dtype=float),
+        "row": row,
+        "token_info": token_info,
+    }
+
+
+def build_token_evidence_tables(vectorizer, clf, x_vec_row, pred_id: int, alt_id: int, top_k=20):
+    """
+    Return:
+      - df_pred: top tokens by contribution to predicted class
+      - df_delta: top tokens by delta between pred and alt (why pred beats alt)
+    Definitions:
+      contribution_pred(t) = tfidf(t) * logP(t|pred)
+      delta_pred_alt(t) = tfidf(t) * (logP(t|pred) - logP(t|alt))
+    """
+    if vectorizer is None or clf is None or x_vec_row is None:
+        return pd.DataFrame(), pd.DataFrame()
+    if not hasattr(clf, "feature_log_prob_"):
+        return pd.DataFrame(), pd.DataFrame()
+
+    feat_log_prob = np.asarray(clf.feature_log_prob_)  # (C, V)
+    row = x_vec_row.tocoo()
+    if row.nnz == 0:
+        return pd.DataFrame(), pd.DataFrame()
+
+    idxs = row.col
+    vals = row.data
+
+    try:
+        feat_names = vectorizer.get_feature_names_out()
+        terms = np.array([str(feat_names[i]) for i in idxs], dtype=object)
+    except Exception:
+        terms = np.array([str(i) for i in idxs], dtype=object)
+
+    logp_pred = feat_log_prob[pred_id, idxs]
+    contrib_pred = vals * logp_pred
+
+    logp_alt = feat_log_prob[alt_id, idxs]
+    delta = vals * (logp_pred - logp_alt)
+
+    # top by contrib_pred (descending: less negative is "bigger", but log probs are negative)
+    # We want tokens with largest contrib_pred (closest to 0).
+    order_pred = np.argsort(contrib_pred)[::-1][: int(top_k)]
+    df_pred = pd.DataFrame(
+        {
+            "term": terms[order_pred],
+            "tfidf": vals[order_pred].astype(float),
+            "logP(term|pred)": logp_pred[order_pred].astype(float),
+            "contribution_pred": contrib_pred[order_pred].astype(float),
+        }
+    )
+
+    # top by delta (descending)
+    order_delta = np.argsort(delta)[::-1][: int(top_k)]
+    df_delta = pd.DataFrame(
+        {
+            "term": terms[order_delta],
+            "tfidf": vals[order_delta].astype(float),
+            "logP(term|pred)": logp_pred[order_delta].astype(float),
+            "logP(term|alt)": logp_alt[order_delta].astype(float),
+            "delta_pred_minus_alt": delta[order_delta].astype(float),
+        }
+    )
+
+    return df_pred, df_delta
+
+
+# =========================
+# Load animations
+# =========================
+LOTTIE_LOADING = load_lottie_url("https://assets10.lottiefiles.com/packages/lf20_usmfx6bp.json")
+LOTTIE_SUCCESS = load_lottie_url("https://assets10.lottiefiles.com/packages/lf20_jbrw3hcz.json")
+
+
+# =========================
+# Cached loaders
+# =========================
+@st.cache_resource(show_spinner=True)
+def load_model(path: str):
+    return joblib.load(path)
+
+
+@st.cache_data(show_spinner=False)
+def load_info(path: str):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
         return None
-
-
-def get_top2_margin(scores_3):
-    s = np.asarray(scores_3, dtype=float).reshape(-1)
-    if s.size < 3:
-        return None
-    idx = np.argsort(s)[::-1]
-    return float(s[idx[0]] - s[idx[1]]), int(idx[0]), int(idx[1])
-
-
-def safe_get_feature_names(vectorizer):
-    if vectorizer is None:
-        return None
-    if hasattr(vectorizer, "get_feature_names_out"):
-        try:
-            return np.asarray(vectorizer.get_feature_names_out())
-        except Exception:
-            return None
-    if hasattr(vectorizer, "get_feature_names"):
-        try:
-            return np.asarray(vectorizer.get_feature_names())
-        except Exception:
-            return None
-    return None
-
-
-def per_term_contributions(vectorizer, clf, X_vec, class_index: int, top_k: int = 20):
-    """
-    Trả về list (term, tfidf, weight, contribution) cho class_index.
-    contribution = tfidf * w_class(term)
-    """
-    if vectorizer is None or clf is None or X_vec is None:
-        return []
-
-    if not hasattr(clf, "coef_"):
-        return []
-
-    names = safe_get_feature_names(vectorizer)
-    if names is None:
-        return []
-
-    coef = np.asarray(clf.coef_)  # (K, D)
-    if class_index >= coef.shape[0]:
-        return []
-
-    # lấy các chỉ số non-zero của input
-    x = X_vec.tocsr()
-    row = x[0]
-    idxs = row.indices
-    vals = row.data
-
-    if idxs.size == 0:
-        return []
-
-    w = coef[class_index, idxs]
-    contrib = vals * w
-
-    df = pd.DataFrame({
-        "term": names[idxs],
-        "tfidf": vals.astype(float),
-        "weight": w.astype(float),
-        "contribution": contrib.astype(float),
-    })
-
-    df = df.sort_values("contribution", ascending=False).head(int(top_k))
-    return list(df[["term", "tfidf", "weight", "contribution"]].itertuples(index=False, name=None))
-
-
-def per_term_delta_between_classes(vectorizer, clf, X_vec, class_a: int, class_b: int, top_k: int = 20):
-    """
-    So sánh lớp A và B trên cùng input:
-    delta(t) = (w_A(t) - w_B(t)) * tfidf(t)
-    delta dương: token đẩy A mạnh hơn B
-    """
-    if vectorizer is None or clf is None or X_vec is None:
-        return []
-
-    if not hasattr(clf, "coef_"):
-        return []
-
-    names = safe_get_feature_names(vectorizer)
-    if names is None:
-        return []
-
-    coef = np.asarray(clf.coef_)  # (K, D)
-    if class_a >= coef.shape[0] or class_b >= coef.shape[0]:
-        return []
-
-    x = X_vec.tocsr()
-    row = x[0]
-    idxs = row.indices
-    vals = row.data
-    if idxs.size == 0:
-        return []
-
-    wa = coef[class_a, idxs]
-    wb = coef[class_b, idxs]
-    delta = (wa - wb) * vals
-
-    df = pd.DataFrame({
-        "term": names[idxs],
-        "tfidf": vals.astype(float),
-        "w_a": wa.astype(float),
-        "w_b": wb.astype(float),
-        "delta": delta.astype(float),
-    })
-    df = df.sort_values("delta", ascending=False).head(int(top_k))
-    return list(df[["term", "tfidf", "w_a", "w_b", "delta"]].itertuples(index=False, name=None))
 
 
 # =========================
 # Header
 # =========================
-st.title("UIT-ViHSD Hate Speech Detection Demo")
-st.caption("Nhập bình luận tiếng Việt. Mô hình dự đoán 1 trong 3 nhãn: 0=CLEAN, 1=OFFENSIVE, 2=HATE.")
+st.title("UIT-ViHSD Demo — TF-IDF + Multinomial Naive Bayes (Step-by-step)")
+st.caption("Mục tiêu: phân tích vì sao mô hình dự đoán đúng/sai bằng cách đi qua từng bước TF-IDF → NB likelihood → posterior.")
 
 with st.expander("Label definitions (paper-based)", expanded=False):
     st.markdown(
-        """- **0 — CLEAN**: Không có công kích hoặc quấy rối.  
-- **1 — OFFENSIVE**: Có từ thô tục hoặc công kích nhưng không nhắm trực tiếp 1 cá nhân hoặc nhóm cụ thể.  
-- **2 — HATE**: Công kích nhắm trực tiếp cá nhân hoặc nhóm (theo đặc điểm, tôn giáo, quốc tịch, ...)."""
+        """- **0 — CLEAN**: Không có công kích/quấy rối.  
+- **1 — OFFENSIVE**: Có từ thô tục/công kích nhưng không nhắm trực tiếp 1 cá nhân/nhóm cụ thể.  
+- **2 — HATE**: Công kích nhắm trực tiếp cá nhân/nhóm (theo đặc điểm, tôn giáo, quốc tịch, ...)."""
     )
 
-LOTTIE_LOADING = load_lottie_url("https://assets10.lottiefiles.com/packages/lf20_usmfx6bp.json")
-LOTTIE_SUCCESS = load_lottie_url("https://assets10.lottiefiles.com/packages/lf20_jbrw3hcz.json")
+# show info.json
+info = load_info(INFO_PATH)
+with st.expander("Model config (from final_best_mnb_tfidf_info.json)", expanded=False):
+    if info is None:
+        st.info("Không đọc được file info JSON.")
+    else:
+        st.json(info)
 
-@st.cache_resource(show_spinner=True)
-def load_model(path: str):
-    return joblib.load(path)
 
 # =========================
-# Load model (unwrap dict)
+# Load model + extract parts
 # =========================
 try:
     loaded = load_model(MODEL_PATH)
 except Exception as e:
     st.error(
-        "Không thể load model. Thường do mismatch phiên bản numpy hoặc scikit-learn.\n\n"
+        "Không thể load model. Thường do mismatch phiên bản numpy/scikit-learn.\n\n"
         f"Error: {type(e).__name__}: {e}"
     )
     st.stop()
 
-vectorizer_override = None
-if isinstance(loaded, dict):
-    model = None
-    for k in ["model", "clf", "pipeline", "estimator"]:
-        if k in loaded:
-            model = loaded[k]
-            break
-    if model is None:
-        candidates = [v for v in loaded.values() if hasattr(v, "predict")]
-        if not candidates:
-            st.error(f"Loaded object is dict but no value has predict. Keys={list(loaded.keys())}")
-            st.stop()
-        model = candidates[0]
-    for k in ["vectorizer", "tfidf", "tfidf_vectorizer"]:
-        if k in loaded:
-            vectorizer_override = loaded[k]
-            break
-else:
-    model = loaded
+model_obj, vectorizer, clf = extract_vectorizer_and_nb(loaded)
 
-parts = extract_parts(model)
-if vectorizer_override is not None:
-    parts.vectorizer = vectorizer_override
+if vectorizer is None or clf is None:
+    st.error("Không detect được vectorizer hoặc classifier trong model. Hãy kiểm tra object đã lưu (pipeline/dict).")
+    st.stop()
 
-analyzer = try_get_analyzer(parts.vectorizer)
+# sanity check: must have NB params
+if not hasattr(clf, "feature_log_prob_") or not hasattr(clf, "class_log_prior_"):
+    st.error("Classifier không phải MultinomialNB (thiếu feature_log_prob_ / class_log_prior_).")
+    st.stop()
+
+
+# =========================
+# Session state to prevent losing results on UI rerun
+# =========================
+if "analysis" not in st.session_state:
+    st.session_state["analysis"] = None
+if "last_text" not in st.session_state:
+    st.session_state["last_text"] = ""
+
 
 # =========================
 # Layout
 # =========================
 left_col, right_col = st.columns(2, gap="large")
 
-# =========================
-# Left: input form
-# =========================
+# -------- Left: Input & controls --------
 with left_col:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Input & Output")
 
-    with st.form("predict_form", clear_on_submit=False):
-        text = st.text_area(
-            "Input text",
-            value=st.session_state.last_text,
-            height=220,
-            placeholder="Nhập bình luận tiếng Việt ở đây...",
-        )
+    text = st.text_area(
+        "Input text",
+        value=st.session_state["last_text"],
+        height=220,
+        placeholder="Nhập bình luận tiếng Việt ở đây...",
+    )
 
-        c1, c2 = st.columns(2)
-        with c1:
-            topk_tfidf = st.number_input("Top-K TF-IDF terms", min_value=5, max_value=50, value=15, step=1)
-        with c2:
-            topk_contrib = st.number_input("Top-K contributing terms", min_value=5, max_value=50, value=15, step=1)
+    c1, c2 = st.columns(2)
+    with c1:
+        topk_tfidf = st.number_input("Top-K TF-IDF terms", min_value=5, max_value=60, value=15, step=1)
+    with c2:
+        topk_terms_class = st.number_input("Top-K terms per class (P(t|c))", min_value=10, max_value=80, value=25, step=5)
 
-        st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
-        slow_mode = st.toggle("Step-by-step (tua chậm)", value=True)
-        speed = st.slider("Tốc độ tua (giây / bước)", min_value=1, max_value=4, value=2, step=1)
-        reveal_k = st.slider("Số token tua dần (top contributors)", min_value=5, max_value=40, value=15, step=1)
+    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
+    slow_mode = st.toggle("Step-by-step (tua chậm)", value=True)
+    speed = st.slider("Tốc độ tua (giây / bước)", min_value=1, max_value=2, value=1, step=1)
 
-        submitted = st.form_submit_button("Predict", type="primary", use_container_width=True)
+    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
+    # Ground-truth optional
+    true_label_opt = st.selectbox(
+        "Nhãn thật (để phân tích đúng/sai) — chọn nếu bạn biết ground-truth",
+        options=["(không chọn)"] + [f"{i} — {LABEL_ID_TO_NAME[i]}" for i in [0, 1, 2]],
+        index=0,
+    )
 
+    run = st.button("Predict & Explain", type="primary", use_container_width=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
+
 # =========================
-# Predict and store in session_state
+# Run analysis (store in session_state to avoid reset)
 # =========================
-if submitted:
+if run:
     if not text or not text.strip():
-        with left_col:
-            st.warning("Please enter a non-empty text.")
+        st.warning("Please enter a non-empty text.")
     else:
-        st.session_state.last_text = text
+        st.session_state["last_text"] = text
 
         if LOTTIE_LOADING is not None:
             with left_col:
-                st_lottie(LOTTIE_LOADING, height=110, key="loading_anim_submit")
+                st_lottie(LOTTIE_LOADING, height=110, key="loading_anim_nb")
 
-        tokens = None
-        if analyzer is not None:
-            try:
-                tokens = analyzer(text)
-            except Exception:
-                tokens = None
+        # vectorize
+        try:
+            X_vec = vectorizer.transform([text])
+        except Exception as e:
+            st.error(f"TF-IDF transform lỗi: {type(e).__name__}: {e}")
+            st.stop()
 
-        X_vec = None
-        if parts.vectorizer is not None:
-            try:
-                X_vec = parts.vectorizer.transform([text])
-            except Exception:
-                X_vec = None
+        # predict by pipeline if possible; else by clf on X_vec
+        try:
+            if isinstance(model_obj, Pipeline):
+                pred_id = int(model_obj.predict([text])[0])
+            else:
+                pred_id = int(clf.predict(X_vec)[0])
+        except Exception:
+            pred_id = int(clf.predict(X_vec)[0])
 
-        # Predict + confidence-like
-        pred, conf = get_confidence(model, [text], vectorizer=parts.vectorizer)
-        pred_id = int(pred[0])
         pred_name = LABEL_ID_TO_NAME.get(pred_id, str(pred_id))
 
-        conf_row = np.asarray(conf[0], dtype=float)
-        if conf_row.size < 3:
-            conf_row = np.pad(conf_row, (0, 3 - conf_row.size), constant_values=0.0)
-        conf_row = conf_row[:3]
+        # NB posterior details
+        details = nb_explain_log_posterior(vectorizer, clf, X_vec, top_k=int(topk_tfidf))
+        if details is None:
+            st.error("Không tính được giải thích NB (thiếu thuộc tính hoặc lỗi dữ liệu).")
+            st.stop()
 
-        df_conf = pd.DataFrame(
-            {"label_id": [0, 1, 2],
-             "label_name": [LABEL_ID_TO_NAME[i] for i in [0, 1, 2]],
-             "score": conf_row}
-        ).sort_values("score", ascending=False)
+        log_prior = np.asarray(details["log_prior"], dtype=float).reshape(-1)
+        log_like = np.asarray(details["log_like"], dtype=float).reshape(-1)
+        log_post = np.asarray(details["log_post"], dtype=float).reshape(-1)
 
-        # Raw SVM scores (nếu lấy được từ coef_)
-        raw_scores = None
-        if X_vec is not None and parts.classifier is not None:
-            raw_scores = compute_scores_from_coef(parts.classifier, X_vec)
+        # confidence-like by softmax over log_post (not calibrated)
+        conf_like = softmax(log_post)
 
-        margin_info = None
-        if raw_scores is not None and np.asarray(raw_scores).size >= 3:
-            m, top1_id, top2_id = get_top2_margin(raw_scores[:3])
-            margin_info = {"margin": m, "top1_id": top1_id, "top2_id": top2_id, "scores3": raw_scores[:3]}
+        df_scores = pd.DataFrame(
+            {
+                "label_id": [0, 1, 2],
+                "label_name": [LABEL_ID_TO_NAME[i] for i in [0, 1, 2]],
+                "log_prior": log_prior[:3],
+                "log_likelihood": log_like[:3],
+                "log_posterior_unnorm": log_post[:3],
+                "softmax(log_posterior)": conf_like[:3],
+            }
+        ).sort_values("log_posterior_unnorm", ascending=False)
+
+        # choose alt class (runner-up)
+        top_order = df_scores.sort_values("log_posterior_unnorm", ascending=False)["label_id"].astype(int).tolist()
+        alt_id = int(top_order[1]) if len(top_order) > 1 else int((pred_id + 1) % 3)
 
         # TF-IDF top terms
-        tfidf_terms = None
-        if parts.vectorizer is not None:
-            tfidf_terms = top_tfidf_terms(parts.vectorizer, text, top_k=int(topk_tfidf))
+        tfidf_terms = tfidf_top_terms(vectorizer, X_vec, top_k=int(topk_tfidf))
+        df_tfidf = pd.DataFrame(tfidf_terms, columns=["term", "tfidf"])
 
-        # Contributions for predicted class (linear)
-        contrib_rich = []
-        if X_vec is not None and parts.vectorizer is not None and parts.classifier is not None:
-            contrib_rich = per_term_contributions(parts.vectorizer, parts.classifier, X_vec, pred_id, top_k=int(topk_contrib))
+        # Token evidence tables
+        df_pred, df_delta_pred_alt = build_token_evidence_tables(
+            vectorizer=vectorizer,
+            clf=clf,
+            x_vec_row=X_vec,
+            pred_id=int(pred_id),
+            alt_id=int(alt_id),
+            top_k=max(10, int(topk_tfidf)),
+        )
 
-        # Compare top1 vs top2 class (để “thuyết phục” hơn)
-        delta_terms = []
-        if margin_info is not None:
-            a = int(margin_info["top1_id"])
-            b = int(margin_info["top2_id"])
-            if X_vec is not None and parts.vectorizer is not None and parts.classifier is not None:
-                delta_terms = per_term_delta_between_classes(parts.vectorizer, parts.classifier, X_vec, a, b, top_k=int(topk_contrib))
+        # If ground truth is selected, add "why wrong/right" against true label
+        true_id = None
+        if true_label_opt != "(không chọn)":
+            true_id = int(true_label_opt.split("—")[0].strip())
 
-        st.session_state.analysis = {
+        df_delta_pred_true = pd.DataFrame()
+        if true_id is not None and true_id in [0, 1, 2]:
+            df_pred_vs_true, df_delta_pred_true = build_token_evidence_tables(
+                vectorizer=vectorizer,
+                clf=clf,
+                x_vec_row=X_vec,
+                pred_id=int(pred_id),
+                alt_id=int(true_id),
+                top_k=max(10, int(topk_tfidf)),
+            )
+            # reuse df_pred_vs_true if desired (not necessary)
+
+        # Per-class top terms distribution (global learned distribution)
+        df_class_terms = {}
+        for cid in [0, 1, 2]:
+            df_class_terms[cid] = nb_class_term_table(vectorizer, clf, class_index=cid, top_k=int(topk_terms_class))
+
+        st.session_state["analysis"] = {
             "text": text,
-            "tokens": tokens,
-            "X_vec": X_vec,
+            "X_vec": X_vec,  # keep sparse
             "pred_id": pred_id,
             "pred_name": pred_name,
-            "df_conf": df_conf,
-            "raw_scores": raw_scores,
-            "margin_info": margin_info,
-            "tfidf_terms": tfidf_terms,
-            "contrib_rich": contrib_rich,
-            "delta_terms": delta_terms,
+            "alt_id": alt_id,
+            "df_scores": df_scores,
+            "df_tfidf": df_tfidf,
+            "df_pred": df_pred,
+            "df_delta_pred_alt": df_delta_pred_alt,
+            "true_id": true_id,
+            "df_delta_pred_true": df_delta_pred_true,
+            "df_class_terms": df_class_terms,
         }
-        st.session_state.did_predict = True
-        st.session_state.play_tokens = False  # reset
+
 
 # =========================
-# Left output
+# Render Left Output (from session_state)
 # =========================
 with left_col:
-    A = st.session_state.analysis
-    if st.session_state.did_predict and A is not None:
+    analysis = st.session_state.get("analysis", None)
+    if analysis is not None:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown("### Prediction")
-        st.markdown(label_badge_html(int(A["pred_id"]), str(A["pred_name"])), unsafe_allow_html=True)
 
-        df_conf = A["df_conf"]
-        top1 = float(df_conf.iloc[0]["score"])
-        st.markdown(f'<div class="muted">Top-1 confidence (hiển thị): <b>{top1:.4f}</b></div>', unsafe_allow_html=True)
-
-        mi = A.get("margin_info", None)
-        if mi is not None:
-            st.markdown(
-                f'<div class="muted">SVM margin (top1 - top2): <b>{float(mi["margin"]):.6f}</b></div>',
-                unsafe_allow_html=True
-            )
+        st.markdown(label_badge_html(int(analysis["pred_id"]), analysis["pred_name"]), unsafe_allow_html=True)
 
         if LOTTIE_SUCCESS is not None:
-            st_lottie(LOTTIE_SUCCESS, height=100, key="success_anim_left")
+            st_lottie(LOTTIE_SUCCESS, height=95, key="success_anim_nb")
 
+        st.markdown(
+            '<div class="muted">Ghi chú: softmax(log posterior) chỉ là “score trực quan”, không phải calibrated probability.</div>',
+            unsafe_allow_html=True,
+        )
         st.markdown('</div>', unsafe_allow_html=True)
 
+
 # =========================
-# Right side tabs
+# Right: Explanation tabs
 # =========================
 with right_col:
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("Giải thích SVM thật rõ trên đúng input này")
+    st.subheader("Explainability — TF-IDF → MultinomialNB (step-by-step)")
 
-    A = st.session_state.analysis
-    if not st.session_state.did_predict or A is None:
-        st.info("Nhập text và nhấn Predict để xem giải thích từng bước.")
-        st.markdown("</div>", unsafe_allow_html=True)
+    analysis = st.session_state.get("analysis", None)
+    if analysis is None:
+        st.info("Nhập text và nhấn Predict & Explain để xem phân tích chi tiết.")
+        st.markdown('</div>', unsafe_allow_html=True)
     else:
-        tab1, tab2, tab3 = st.tabs(["Confidence", "SVM mechanism (step-by-step)", "Token evidence (animated)"])
+        tab1, tab2, tab3, tab4 = st.tabs(
+            ["1) Overview scores", "2) Step-by-step animation", "3) Learned distributions P(t|c)", "4) Token evidence (đúng/sai)"]
+        )
 
-        # -------- Tab 1
+        # -------- Tab 1: Overview
         with tab1:
-            st.markdown("### Confidence scores (3 labels)")
-            df_conf = A["df_conf"]
-            st.dataframe(df_conf, use_container_width=True, hide_index=True)
+            st.markdown("### Tổng hợp điểm theo từng lớp")
 
-            df_plot = df_conf.sort_values("label_id")
+            df_scores = analysis["df_scores"]
+            st.dataframe(df_scores, use_container_width=True, hide_index=True)
+
+            df_plot = df_scores.sort_values("label_id")
             fig = px.bar(
                 df_plot,
                 x="label_name",
-                y="score",
-                text="score",
-                range_y=[0, max(1.0, float(df_plot["score"].max()) * 1.15)],
+                y="softmax(log_posterior)",
+                text="softmax(log_posterior)",
+                range_y=[0, max(1.0, float(df_plot["softmax(log_posterior)"].max()) * 1.15)],
             )
             fig.update_traces(texttemplate="%{text:.4f}", textposition="outside")
             fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=320)
-            st.plotly_chart(fig, use_container_width=True, key="plot_conf")
+            st.plotly_chart(fig, use_container_width=True, key="plot_nb_conf")
 
             st.markdown(
-                '<div class="muted">Ghi chú: nếu model không có predict_proba, app chuyển decision_function sang dạng score để hiển thị.</div>',
-                unsafe_allow_html=True
+                """
+**Ý nghĩa các cột**  
+- $\\log P(c)$: prior theo lớp  
+- $\\log P(x\\mid c)$: likelihood (cộng dồn theo token)  
+- $\\log P(c) + \\log P(x\\mid c)$: posterior chưa chuẩn hoá  
+- softmax: để nhìn trực quan “lớp nào trội hơn”
+                """
             )
 
-        # -------- Tab 2
-        with tab2:
-            st.markdown("### Cơ chế: từ text -> TF-IDF vector x -> SVM scores -> nhãn cuối")
+            # -------- Tab 2: Step-by-step animation (MANUAL NEXT)
+            with tab2:
+                st.markdown("### Step-by-step: bấm nút để qua từng bước (không tự động)")
 
-            text_in = A["text"]
-            tokens = A["tokens"]
-            X_vec = A["X_vec"]
-            raw_scores = A.get("raw_scores", None)
-            mi = A.get("margin_info", None)
+                # init step state
+                if "nb_step" not in st.session_state:
+                    st.session_state["nb_step"] = 1
 
-            prog = st.progress(0, text="Chuẩn bị tua chậm...")
-            ph = st.empty()
+                # convenience
+                step_now = int(st.session_state["nb_step"])
+                total_steps = 5
 
-            def step(i, total, title, body_md=None, df=None):
-                prog.progress(int(i / total * 100), text=title)
-                with ph.container():
-                    st.markdown(f"#### Bước {i} trên {total}: {title}")
-                    if body_md:
-                        st.markdown(body_md)
-                    if df is not None:
-                        st.dataframe(df, use_container_width=True, hide_index=True)
-                if slow_mode:
+                # controls row
+                cbtn1, cbtn2, cbtn3, cbtn4 = st.columns([1.2, 1.2, 2.2, 2.2])
+                with cbtn1:
+                    if st.button("Reset", use_container_width=True, key="btn_nb_reset"):
+                        st.session_state["nb_step"] = 1
+                        st.rerun()
+                with cbtn2:
+                    if st.button("Next step", type="primary", use_container_width=True, key="btn_nb_next"):
+                        st.session_state["nb_step"] = min(total_steps, int(st.session_state["nb_step"]) + 1)
+                        st.rerun()
+                with cbtn3:
+                    if st.button("Prev", use_container_width=True, key="btn_nb_prev"):
+                        st.session_state["nb_step"] = max(1, int(st.session_state["nb_step"]) - 1)
+                        st.rerun()
+                with cbtn4:
+                    auto_play = st.toggle("Auto-play (tuỳ chọn)", value=False, key="nb_autoplay_toggle")
+
+                # Optional autoplay (only if you turn it on)
+                # It advances ONE step per rerun with a delay, but you can keep it OFF for presentation.
+                if auto_play and step_now < total_steps:
                     time.sleep(float(speed))
+                    st.session_state["nb_step"] = step_now + 1
+                    st.rerun()
 
-            total_steps = 4
+                st.markdown(f"**Step hiện tại:** {step_now}/{total_steps}")
+                st.progress(int(step_now / total_steps * 100))
 
-            # Step 1: tokenize
-            if tokens is None:
-                token_text = "- Không lấy được tokens từ analyzer."
-            else:
-                preview = tokens[:80]
-                token_text = f"- Số token theo analyzer: {len(tokens)}\n- Preview: `{preview}`"
-            step(1, total_steps, "Input và tokens", body_md=f"**Input:** `{text_in}`\n\n{token_text}")
+                # pull artifacts
+                text0 = analysis["text"]
+                X_vec = analysis["X_vec"]
+                df_tfidf = analysis["df_tfidf"]
+                df_scores = analysis["df_scores"]
+                pred_name = analysis["pred_name"]
+                pred_id = int(analysis["pred_id"])
+                alt_id = int(analysis["alt_id"])
+                alt_name = LABEL_ID_TO_NAME.get(alt_id, str(alt_id))
+                df_pred = analysis["df_pred"].copy()
 
-            # Step 2: TF-IDF stats + top terms
-            if X_vec is None or parts.vectorizer is None:
-                step(2, total_steps, "TF-IDF vector hoá", body_md="- Không vectorize được TF-IDF.")
-            else:
-                nnz = int(X_vec.nnz)
-                n_features = int(X_vec.shape[1])
-                l2 = float(np.sqrt(X_vec.multiply(X_vec).sum()))
-                sparsity = 1.0 - (nnz / max(1, n_features))
-                df_tfidf = pd.DataFrame(A["tfidf_terms"] or [], columns=["term", "tfidf_weight"])
+                # -------- Step 1 --------
+                if step_now >= 1:
+                    st.markdown("#### Bước 1/5: Nhận input text")
+                    st.markdown(f"**Input:** `{text0}`")
 
-                md2 = (
-                    "TF-IDF tạo vector đặc trưng x rất thưa\n\n"
-                    f"- n_features = {n_features}\n"
-                    f"- nnz = {nnz}\n"
-                    f"- sparsity = {sparsity:.6f}\n"
-                    f"- norm_2 = {l2:.6f}\n\n"
-                    "Top TF-IDF terms:"
-                )
-                step(2, total_steps, "TF-IDF tạo vector x", body_md=md2, df=df_tfidf)
+                # -------- Step 2 --------
+                if step_now >= 2:
+                    st.markdown("#### Bước 2/5: TF-IDF biến text thành vector $x$")
+                    try:
+                        nnz = int(X_vec.nnz)
+                        n_features = int(X_vec.shape[1])
+                        l2 = float(np.sqrt(X_vec.multiply(X_vec).sum()))
+                        sparsity = 1.0 - (nnz / max(1, n_features))
+                        st.markdown(
+                            f"- $n\\_features = {n_features}$\n"
+                            f"- $nnz = {nnz}$\n"
+                            f"- $sparsity = {sparsity:.6f}$\n"
+                            f"- $\\lVert x \\rVert_2 = {l2:.6f}$\n"
+                        )
+                    except Exception:
+                        st.info("Không tính được thống kê TF-IDF vector.")
 
-            # Step 3: scores
-            if raw_scores is None or np.asarray(raw_scores).size < 3:
-                step(3, total_steps, "SVM tính score", body_md="- Không lấy được score theo coef. (Có thể classifier không có coef_).")
-            else:
-                s3 = np.asarray(raw_scores).reshape(-1)[:3]
-                df_s = pd.DataFrame({
-                    "label_id": [0, 1, 2],
-                    "label_name": [LABEL_ID_TO_NAME[i] for i in [0, 1, 2]],
-                    "svm_score": s3
-                }).sort_values("svm_score", ascending=False)
+                    st.markdown("Top TF-IDF terms trong input:")
+                    st.dataframe(df_tfidf, use_container_width=True, hide_index=True)
 
-                md3 = (
-                    "SVM tuyến tính tính điểm từng lớp theo\n\n"
-                    "$$score_k = w_k^T x + b_k$$\n\n"
-                    "Bảng score:"
-                )
-                step(3, total_steps, "Tính score cho 3 lớp", body_md=md3, df=df_s)
+                # -------- Step 3 --------
+                if step_now >= 3:
+                    st.markdown("#### Bước 3/5: Naive Bayes đã học gì từ train?")
+                    st.markdown(
+                        """
+    MultinomialNB học 2 nhóm tham số:
 
-            # Step 4: argmax + margin
-            pred_id = int(A["pred_id"])
-            pred_name = str(A["pred_name"])
+    - Prior theo lớp: $\\log P(c)$  
+    - Likelihood theo token: $\\log P(t\\mid c)$  
 
-            if mi is None:
-                md4 = f"Nhãn cuối theo argmax score: **{pred_name} ({pred_id})**"
-            else:
-                md4 = (
-                    "Chọn nhãn cuối theo\n\n"
-                    "$$y_hat = argmax_k score_k$$\n\n"
-                    f"- Top1: {LABEL_ID_TO_NAME[int(mi['top1_id'])]} ({int(mi['top1_id'])})\n"
-                    f"- Top2: {LABEL_ID_TO_NAME[int(mi['top2_id'])]} ({int(mi['top2_id'])})\n"
-                    f"- Margin = {float(mi['margin']):.6f}\n\n"
-                    f"=> Kết luận: **{pred_name} ({pred_id})**"
-                )
-            step(4, total_steps, "Argmax -> nhãn cuối", body_md=md4)
-
-            prog.progress(100, text="Hoàn tất.")
-
-        # -------- Tab 3: animated evidence
-        with tab3:
-            st.markdown("### Evidence theo token (animation)")
-
-            pred_id = int(A["pred_id"])
-            pred_name = str(A["pred_name"])
-            contrib = A.get("contrib_rich", [])
-            delta = A.get("delta_terms", [])
-            mi = A.get("margin_info", None)
-
-            colA, colB = st.columns([1, 1])
-            with colA:
-                play = st.button("Play token reveal", type="primary", use_container_width=True)
-                if play:
-                    st.session_state.play_tokens = True
-            with colB:
-                st.markdown('<div class="small">Bước token chạy nhanh gấp 10 lần speed ở cột trái.</div>', unsafe_allow_html=True)
-
-            if not contrib:
-                st.info("Không có contribution details. Thường do classifier không có coef_.")
-            else:
-                st.markdown(
-                    "Định nghĩa đóng góp (với lớp dự đoán)\n\n"
-                    "$$contribution_t = tfidf_t * w_{y_hat,t}$$"
-                )
-
-                k = int(min(reveal_k, len(contrib)))
-                fast_sleep = float(speed) / 10.0
-
-                table_ph = st.empty()
-                chart_ph = st.empty()
-                cum_ph = st.empty()
-
-                # Chuẩn bị data
-                run_rows = []
-                running = 0.0
-
-                if st.session_state.play_tokens:
-                    for i in range(k):
-                        term, tfidf_v, w_v, c_v = contrib[i]
-                        running += float(c_v)
-                        run_rows.append([term, float(tfidf_v), float(w_v), float(c_v), float(running)])
-
-                        df_run = pd.DataFrame(run_rows, columns=["term", "tfidf", "weight", "contribution", "cumulative"])
-                        table_ph.dataframe(df_run, use_container_width=True, hide_index=True)
-
-                        # bar chart contribution
-                        figc = px.bar(df_run, x="term", y="contribution", text="contribution")
-                        figc.update_traces(texttemplate="%{text:.4f}", textposition="outside")
-                        figc.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10))
-                        chart_ph.plotly_chart(figc, use_container_width=True, key=f"contrib_bar_{i}")
-
-                        cum_ph.markdown(f"**Cumulative contribution (top {i+1} terms):** {running:.6f}")
-
-                        if slow_mode:
-                            time.sleep(fast_sleep)
-
-                    st.session_state.play_tokens = False
-                else:
-                    # show static top-k
-                    df_static = pd.DataFrame(
-                        contrib[:k],
-                        columns=["term", "tfidf", "weight", "contribution"]
+    Các giá trị này được học từ thống kê tần suất token theo lớp (có smoothing).
+                        """
                     )
-                    st.dataframe(df_static, use_container_width=True, hide_index=True)
+                    st.info("Gợi ý trình bày: mở Tab “Learned distributions P(t|c)” để xem bảng top token theo từng lớp.")
 
-            # Compare top1 vs top2 (rất hữu ích để “giải thích với giáo sư”)
-            if mi is not None and delta:
-                a = int(mi["top1_id"])
-                b = int(mi["top2_id"])
-                st.markdown("### So sánh 2 lớp mạnh nhất (top1 vs top2)")
-                st.markdown(
-                    "Token nào khiến top1 thắng top2 được thể hiện bởi\n\n"
-                    "$$delta_t = (w_{top1,t} - w_{top2,t}) * tfidf_t$$"
-                )
-                df_delta = pd.DataFrame(delta, columns=["term", "tfidf", "w_top1", "w_top2", "delta"])
+                # -------- Step 4 --------
+                if step_now >= 4:
+                    st.markdown("#### Bước 4/5: Tính likelihood và posterior cho 3 lớp")
+                    st.markdown(
+                        """
+    Với input hiện tại, NB tính:
+
+    $$
+    \\log P(x\\mid c) = \\sum\\_{t \\in input} x_t \\cdot \\log P(t\\mid c)
+    $$
+
+    Sau đó:
+
+    $$
+    \\log P(c\\mid x) \\propto \\log P(c) + \\log P(x\\mid c)
+    $$
+                        """
+                    )
+                    st.dataframe(df_scores, use_container_width=True, hide_index=True)
+
+                    st.markdown(
+                        f"**Kết luận hiện tại:** `{pred_id}` — **{pred_name}** (so với runner-up: **{alt_name}**) "
+                    )
+
+                # -------- Step 5 --------
+                if step_now >= 5:
+                    st.markdown("#### Bước 5/5: Token evidence (tua dần theo nút bấm)")
+
+                    st.markdown(
+                        f"""
+    Ta hiển thị token đóng góp mạnh cho lớp dự đoán **{pred_name}**.
+
+    Định nghĩa:
+
+    $$
+    contribution\\_t = x_t \\cdot \\log P(t\\mid \\hat{{y}})
+    $$
+
+    Và để thấy vì sao **{pred_name}** thắng **{alt_name}**:
+
+    $$
+    delta\\_t = x_t \\cdot (\\log P(t\\mid \\hat{{y}}) - \\log P(t\\mid alt))
+    $$
+                        """
+                    )
+
+                    if df_pred.empty:
+                        st.info("Không có token evidence (vector rỗng hoặc không match vocab).")
+                    else:
+                        # --- Manual reveal inside step 5 ---
+                        if "nb_reveal_i" not in st.session_state:
+                            st.session_state["nb_reveal_i"] = 0
+
+                        kmax = int(min(25, len(df_pred)))
+
+                        r1, r2, r3, r4 = st.columns([1.2, 1.2, 1.6, 2.0])
+                        with r1:
+                            if st.button("Reveal +1", type="primary", use_container_width=True, key="btn_reveal1"):
+                                st.session_state["nb_reveal_i"] = min(kmax, int(st.session_state["nb_reveal_i"]) + 1)
+                                st.rerun()
+                        with r2:
+                            if st.button("Reveal +5", use_container_width=True, key="btn_reveal5"):
+                                st.session_state["nb_reveal_i"] = min(kmax, int(st.session_state["nb_reveal_i"]) + 5)
+                                st.rerun()
+                        with r3:
+                            if st.button("Reset reveal", use_container_width=True, key="btn_reveal_reset"):
+                                st.session_state["nb_reveal_i"] = 0
+                                st.rerun()
+                        with r4:
+                            # optional auto for reveal only
+                            auto_reveal = st.toggle("Auto reveal (tuỳ chọn)", value=False, key="toggle_auto_reveal")
+
+                        # optional auto reveal
+                        if auto_reveal and int(st.session_state["nb_reveal_i"]) < kmax:
+                            time.sleep(float(speed) / 10.0)  # vẫn giữ logic “nhanh gấp 10”
+                            st.session_state["nb_reveal_i"] = min(kmax, int(st.session_state["nb_reveal_i"]) + 1)
+                            st.rerun()
+
+                        shown = int(st.session_state["nb_reveal_i"])
+                        st.markdown(f"**Đã reveal:** {shown}/{kmax} token")
+
+                        if shown > 0:
+                            df_show = df_pred.head(shown).copy()
+                            cum = float(df_show["contribution_pred"].sum())
+                            st.dataframe(df_show, use_container_width=True, hide_index=True)
+                            st.markdown(f"**Cumulative contribution (top {shown} terms):** {cum:.6f}")
+                        else:
+                            st.info("Bấm Reveal để hiện dần token.")
+
+                # Important: when user goes back to step < 5, keep reveal but do not show it
+                # (no reset unless user presses Reset reveal or Reset step).
+
+        # -------- Tab 3: Learned distributions
+        with tab3:
+            st.markdown("### Bảng phân phối đã học: $P(t\\mid c)$ (hiển thị top terms)")
+
+            st.markdown(
+                """
+Ở MultinomialNB, mỗi lớp có một phân phối theo token.  
+App hiển thị top token có $\\log P(t\\mid c)$ cao nhất (tương đương $P(t\\mid c)$ cao nhất).  
+Đây là “tín hiệu kiểu lớp” mà mô hình học được từ dữ liệu train.
+                """
+            )
+
+            df_class_terms = analysis["df_class_terms"]
+            cA, cB, cC = st.columns(3)
+
+            with cA:
+                st.markdown("#### CLEAN")
+                st.dataframe(df_class_terms[0], use_container_width=True, hide_index=True)
+            with cB:
+                st.markdown("#### OFFENSIVE")
+                st.dataframe(df_class_terms[1], use_container_width=True, hide_index=True)
+            with cC:
+                st.markdown("#### HATE")
+                st.dataframe(df_class_terms[2], use_container_width=True, hide_index=True)
+
+        # -------- Tab 4: Token evidence (right/wrong)
+        with tab4:
+            pred_id = int(analysis["pred_id"])
+            pred_name = analysis["pred_name"]
+            alt_id = int(analysis["alt_id"])
+            alt_name = LABEL_ID_TO_NAME.get(alt_id, str(alt_id))
+
+            st.markdown("### Token evidence để giải thích vì sao đúng/sai")
+
+            st.markdown(
+                f"""
+**Ý tưởng nói với giáo sư (gọn, đúng bản chất):**  
+- TF-IDF tạo vector $x$ (token nào nổi bật thì $x_t$ lớn).  
+- Naive Bayes có $\\log P(t\\mid c)$ cho từng lớp.  
+- Với input này, mô hình cộng dồn $x_t\\cdot\\log P(t\\mid c)$ để ra $\\log P(x\\mid c)$.  
+- Lớp nào có $\\log P(c)+\\log P(x\\mid c)$ lớn nhất thì là nhãn dự đoán.
+                """
+            )
+
+            st.markdown("#### A) Token đóng góp mạnh cho lớp dự đoán")
+            df_pred = analysis["df_pred"]
+            if df_pred.empty:
+                st.info("Không có token evidence (vector rỗng hoặc không match vocab).")
+            else:
+                st.dataframe(df_pred, use_container_width=True, hide_index=True)
+
+            st.markdown(f"#### B) Vì sao {pred_name} thắng {alt_name} (delta token-level)")
+            df_delta = analysis["df_delta_pred_alt"]
+            if df_delta.empty:
+                st.info("Không dựng được bảng delta.")
+            else:
                 st.dataframe(df_delta, use_container_width=True, hide_index=True)
 
-                figd = px.bar(df_delta.head(min(20, len(df_delta))), x="term", y="delta", text="delta")
-                figd.update_traces(texttemplate="%{text:.4f}", textposition="outside")
-                figd.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10))
-                st.plotly_chart(figd, use_container_width=True, key="delta_bar")
+            # Wrong/right vs true
+            true_id = analysis.get("true_id", None)
+            if true_id is None:
+                st.markdown(
+                    '<div class="muted">Nếu bạn chọn “Nhãn thật” ở cột trái, app sẽ phân tích cụ thể vì sao đúng/sai so với ground-truth.</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                true_name = LABEL_ID_TO_NAME.get(int(true_id), str(true_id))
+                if int(true_id) == int(pred_id):
+                    st.success(f"Ground-truth = {true_name}. Mô hình dự đoán ĐÚNG.")
+                else:
+                    st.error(f"Ground-truth = {true_name}, nhưng mô hình dự đoán = {pred_name}. Đây là lỗi dự đoán.")
 
-            st.markdown(
-                f'<div class="muted">Gợi ý thuyết minh: input được gán nhãn <b>{pred_name}</b> vì tổng contribution (và delta so với lớp kế tiếp) '
-                'bị chi phối bởi các token có TF-IDF lớn và trọng số w tương ứng kéo score lớp đó lên.</div>',
-                unsafe_allow_html=True
-            )
+                st.markdown(
+                    f"""
+#### C) Phân tích lỗi so với ground-truth ({true_name})
 
-    st.markdown("</div>", unsafe_allow_html=True)
+Ta nhìn $delta\\_t$ giữa lớp dự đoán và lớp đúng:
+
+$$
+delta\\_t = x_t \\cdot (\\log P(t\\mid pred) - \\log P(t\\mid true))
+$$
+
+- Nếu $delta\\_t$ dương lớn: token khiến mô hình nghiêng về lớp dự đoán hơn lớp đúng  
+- Nếu $delta\\_t$ âm: token ủng hộ lớp đúng (nhưng không đủ mạnh để thắng)
+                    """
+                )
+
+                df_delta_true = analysis.get("df_delta_pred_true", pd.DataFrame())
+                if df_delta_true is None or df_delta_true.empty:
+                    st.info("Không dựng được bảng delta_pred_minus_true.")
+                else:
+                    st.dataframe(df_delta_true, use_container_width=True, hide_index=True)
+
+    st.markdown('</div>', unsafe_allow_html=True)
