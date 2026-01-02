@@ -1,0 +1,19 @@
+{
+  "model": "TFIDF + MultinomialNB",
+  "best_tag": "WORD",
+  "best_params": {
+    "clf__alpha": 0.004582133690843357,
+    "clf__fit_prior": true,
+    "tfidf__analyzer": "word",
+    "tfidf__max_df": 1.0,
+    "tfidf__max_features": 50000,
+    "tfidf__min_df": 1,
+    "tfidf__ngram_range": [
+      1,
+      2
+    ]
+  },
+  "best_dev_score": 0.5595092912181371,
+  "test_f1_macro": 0.5410826321731198,
+  "test_acc": 0.8456586826347305
+}
