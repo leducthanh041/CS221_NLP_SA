@@ -67,7 +67,7 @@ python --version
 cd C:\path\to\hydro_web_demo
 
 # (3) tạo venv bằng py launcher
-py -3.11 -m venv .venv
+py -3.12 -m venv .venv
 # hoặc: python -m venv .venv
 
 # (4) nếu cần: cho phép chạy script activation (chỉ 1 lần)
