@@ -9,6 +9,7 @@ import streamlit as st
 import plotly.express as px
 import requests
 
+from pathlib import Path
 from streamlit_lottie import st_lottie
 from sklearn.pipeline import Pipeline
 
@@ -21,18 +22,25 @@ except Exception:
 
 
 # =========================
-# Config
+# Config (ROBUST PATHS FOR STREAMLIT CLOUD)
 # =========================
-TRAIN_PATH = ".././UIT-ViHSD-preprocessed/train.csv"  # chỉnh đúng đường dẫn của bạn
 st.set_page_config(page_title="UIT-ViHSD — TF-IDF + MultinomialNB Demo", layout="wide")
 
-MODEL_PATH = "final_best_mnb_tfidf.joblib"
-INFO_PATH = "final_best_mnb_tfidf_info.json"
+BASE_DIR = Path(__file__).resolve().parent  # thư mục chứa app.py
 
-LABEL_ID_TO_NAME = {0: "CLEAN", 1: "OFFENSIVE", 2: "HATE"}
+# Nếu bạn để các file cùng cấp với app.py trong GitHub repo, dùng cấu hình này:
+MODEL_PATH = BASE_DIR / "final_best_mnb_tfidf.joblib"
+INFO_PATH = BASE_DIR / "final_best_mnb_tfidf_info.json"
 
 # Stopword file (optional). Nếu không có file, app tự bỏ qua bước stopword.
-STOPWORD_FILE = "vietnamese-stopwords.txt"
+STOPWORD_FILE = BASE_DIR / "vietnamese-stopwords.txt"
+
+# Train CSV cho thống kê token-train (Tab D).
+# Khuyến nghị: đặt file trong repo theo cấu trúc:
+# repo_root/UIT-ViHSD-preprocessed/train.csv
+TRAIN_PATH = BASE_DIR / "UIT-ViHSD-preprocessed" / "train.csv"
+
+LABEL_ID_TO_NAME = {0: "CLEAN", 1: "OFFENSIVE", 2: "HATE"}
 
 
 # =========================
@@ -119,7 +127,6 @@ def nb_class_logodds_table(vectorizer, clf, class_index: int, top_k=30):
     log_w = log_prior[others] - logZ  # (C-1,)
 
     # log P(t|not c) = logsumexp_j (log w_j + log P(t|j))
-    # build matrix (C-1, V)
     mat = log_w.reshape(-1, 1) + logP_tc[others, :]
     logP_t_notc = logsumexp(mat, axis=0)  # (V,)
 
@@ -137,8 +144,12 @@ def nb_class_logodds_table(vectorizer, clf, class_index: int, top_k=30):
 
 
 @st.cache_data(show_spinner=False)
-def load_train_csv_for_stats(path: str):
-    df = pd.read_csv(path)
+def load_train_csv_for_stats(path: Path):
+    try:
+        df = pd.read_csv(str(path))
+    except Exception:
+        return None
+
     if "free_text" not in df.columns or "label_id" not in df.columns:
         return None
     df = df.dropna(subset=["free_text", "label_id"]).reset_index(drop=True)
@@ -159,7 +170,6 @@ def keyword_distribution_stats(train_df: pd.DataFrame, keywords, labels=(0, 1, 2
     if not keywords:
         return pd.DataFrame()
 
-    # optional cut
     kws = [str(k) for k in keywords if k and str(k).strip()]
     if top_k is not None:
         kws = kws[: int(top_k)]
@@ -176,7 +186,6 @@ def keyword_distribution_stats(train_df: pd.DataFrame, keywords, labels=(0, 1, 2
         row["Total Count"] = int(total)
 
         denom = total if total > 0 else 1
-        # tỉ lệ thô theo từng lớp (để giải thích “lexical bias”)
         for lid in labels:
             cnt = row[f"In {LABEL_ID_TO_NAME[int(lid)]} ({int(lid)})"]
             row[f"% {LABEL_ID_TO_NAME[int(lid)]}"] = round(cnt / denom * 100.0, 1)
@@ -184,7 +193,6 @@ def keyword_distribution_stats(train_df: pd.DataFrame, keywords, labels=(0, 1, 2
         stats.append(row)
 
     df_stats = pd.DataFrame(stats)
-    # ưu tiên token xuất hiện nhiều
     df_stats = df_stats.sort_values("Total Count", ascending=False).reset_index(drop=True)
     return df_stats
 
@@ -221,9 +229,9 @@ _URL_RE = re.compile(r"(http\S+|www\S+|https\S+)", flags=re.IGNORECASE)
 _MENTION_RE = re.compile(r"@\w+", flags=re.UNICODE)
 
 @st.cache_resource(show_spinner=False)
-def load_stopwords(path: str):
+def load_stopwords(path: Path):
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(str(path), "r", encoding="utf-8") as f:
             sw = set([line.strip() for line in f if line.strip()])
         return sw
     except Exception:
@@ -232,7 +240,7 @@ def load_stopwords(path: str):
 
 def preprocess_text(text: str) -> str:
     """
-    Pipeline (giống tinh thần notebook):
+    Pipeline:
     1) normalize str + strip
     2) lowercase
     3) remove URL
@@ -248,29 +256,18 @@ def preprocess_text(text: str) -> str:
     if not s:
         return ""
 
-    # lowercase
     s = s.lower()
-
-    # remove url
     s = _URL_RE.sub(" ", s)
-
-    # remove mention
     s = _MENTION_RE.sub(" ", s)
-
-    # remove hashtag symbol only (giữ lại token)
     s = s.replace("#", " ")
-
-    # collapse spaces
     s = re.sub(r"\s+", " ", s).strip()
 
-    # word segmentation
     if _HAS_PYVI:
         try:
             s = ViTokenizer.tokenize(s)
         except Exception:
             pass
 
-    # remove stopwords (optional)
     sw = load_stopwords(STOPWORD_FILE)
     if sw is not None:
         toks = s.split()
@@ -295,7 +292,6 @@ def extract_vectorizer_and_nb(loaded):
     clf = None
     model = loaded
 
-    # unwrap dict
     if isinstance(loaded, dict):
         for k in ["pipeline", "model", "estimator", "clf"]:
             if k in loaded:
@@ -344,23 +340,6 @@ def tfidf_top_terms(vectorizer, x_vec_row, top_k=15):
         return [(str(feat_names[idxs[i]]), float(vals[i])) for i in order]
     except Exception:
         return []
-
-
-def nb_class_term_table(vectorizer, clf, class_index: int, top_k=25):
-    if vectorizer is None or clf is None:
-        return pd.DataFrame(columns=["term", "log_P_t_given_c", "P_t_given_c"])
-    if not hasattr(clf, "feature_log_prob_"):
-        return pd.DataFrame(columns=["term", "log_P_t_given_c", "P_t_given_c"])
-    try:
-        feat_names = vectorizer.get_feature_names_out()
-        logp = np.asarray(clf.feature_log_prob_)[class_index]
-        order = np.argsort(logp)[::-1][: int(top_k)]
-        terms = [str(feat_names[i]) for i in order]
-        logps = logp[order]
-        ps = np.exp(logps)
-        return pd.DataFrame({"term": terms, "log_P_t_given_c": logps, "P_t_given_c": ps})
-    except Exception:
-        return pd.DataFrame(columns=["term", "log_P_t_given_c", "P_t_given_c"])
 
 
 def nb_explain_log_posterior(vectorizer, clf, x_vec_row):
@@ -447,13 +426,13 @@ LOTTIE_SUCCESS = load_lottie_url("https://assets10.lottiefiles.com/packages/lf20
 # Cached loaders
 # =========================
 @st.cache_resource(show_spinner=True)
-def load_model(path: str):
-    return joblib.load(path)
+def load_model(path: Path):
+    return joblib.load(str(path))
 
 @st.cache_data(show_spinner=False)
-def load_info(path: str):
+def load_info(path: Path):
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(str(path), "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
@@ -472,6 +451,14 @@ with st.expander("Label definitions (paper-based)", expanded=False):
 - **2 — HATE**: Công kích nhắm trực tiếp cá nhân/nhóm (theo đặc điểm, tôn giáo, quốc tịch, ...)."""
     )
 
+# Optional debug: kiểm tra file có tồn tại trên Streamlit Cloud không
+with st.expander("Debug paths (deploy check)", expanded=False):
+    st.write("BASE_DIR:", str(BASE_DIR))
+    st.write("MODEL_PATH:", str(MODEL_PATH), "exists:", MODEL_PATH.exists())
+    st.write("INFO_PATH :", str(INFO_PATH), "exists:", INFO_PATH.exists())
+    st.write("STOPWORD_FILE:", str(STOPWORD_FILE), "exists:", STOPWORD_FILE.exists())
+    st.write("TRAIN_PATH:", str(TRAIN_PATH), "exists:", TRAIN_PATH.exists())
+
 info = load_info(INFO_PATH)
 with st.expander("Model config (from final_best_mnb_tfidf_info.json)", expanded=False):
     if info is None:
@@ -486,9 +473,11 @@ with st.expander("Model config (from final_best_mnb_tfidf_info.json)", expanded=
 try:
     loaded = load_model(MODEL_PATH)
 except Exception as e:
+    # Lưu ý: FileNotFoundError là do path/file không có trong runtime, không phải mismatch sklearn.
     st.error(
-        "Không thể load model. Thường do mismatch phiên bản numpy/scikit-learn.\n\n"
-        f"Error: {type(e).__name__}: {e}"
+        "Không thể load model.\n\n"
+        f"Error: {type(e).__name__}: {e}\n\n"
+        "Gợi ý: hãy mở expander 'Debug paths (deploy check)' để xem file có tồn tại trên server không."
     )
     st.stop()
 
@@ -614,10 +603,10 @@ if run:
 
         tfidf_terms = tfidf_top_terms(vectorizer, X_vec, top_k=int(topk_tfidf))
         df_tfidf = pd.DataFrame(tfidf_terms, columns=["term", "tfidf"])
-        
+
+        # Train stats: nếu file train không tồn tại trên deploy thì train_df_stats = None
         train_df_stats = load_train_csv_for_stats(TRAIN_PATH)
 
-        # keywords lấy từ top TF-IDF terms của input (tổng quát)
         keywords_from_input = []
         if df_tfidf is not None and not df_tfidf.empty and "term" in df_tfidf.columns:
             keywords_from_input = df_tfidf["term"].astype(str).tolist()
@@ -626,9 +615,8 @@ if run:
             train_df=train_df_stats,
             keywords=keywords_from_input,
             labels=(0, 1, 2),
-            top_k=10,  # bạn có thể cho user control nếu muốn
+            top_k=10,
         )
-
 
         df_pred, df_delta_pred_alt = build_token_evidence_tables(
             vectorizer=vectorizer,
@@ -654,7 +642,6 @@ if run:
                 top_k=max(10, int(topk_tfidf)),
             )
 
-        # Per-class log-odds tables (global learned distinctiveness)
         df_class_logodds = {}
         for cid in [0, 1, 2]:
             df_class_logodds[cid] = nb_class_logodds_table(
@@ -663,7 +650,6 @@ if run:
                 class_index=cid,
                 top_k=int(topk_terms_class),
             )
-
 
         st.session_state["analysis"] = {
             "text_raw": text,
@@ -701,7 +687,6 @@ with left_col:
             unsafe_allow_html=True,
         )
 
-        # Debug (ẩn)
         with st.expander("Debug (ẩn): xem preprocessing input", expanded=False):
             st.markdown("**Raw input:**")
             st.code(analysis["text_raw"], language="text")
@@ -730,7 +715,6 @@ with right_col:
             ["1) Overview scores", "2) Step-by-step (manual)", "3) Learned P(t|c)", "4) Token evidence (đúng/sai)"]
         )
 
-        # -------- Tab 1
         with tab1:
             st.markdown("### Tổng hợp điểm theo từng lớp")
             df_scores = analysis["df_scores"]
@@ -758,7 +742,6 @@ with right_col:
                 """
             )
 
-        # -------- Tab 2 (Manual step)
         with tab2:
             st.markdown("### Step-by-step: bấm nút để qua từng bước (không tự động)")
 
@@ -901,20 +884,19 @@ $$
                     else:
                         st.info("Bấm Reveal để hiện dần token.")
 
-        # -------- Tab 3
         with tab3:
             st.markdown("### Token đặc trưng theo lớp bằng Log-odds")
 
             st.markdown(
                 """
-        Thay vì chỉ xem token có $\\log P(t\\mid c)$ cao, ta xem **độ phân biệt** của token cho lớp $c$ so với phần còn lại:
+Thay vì chỉ xem token có $\\log P(t\\mid c)$ cao, ta xem **độ phân biệt** của token cho lớp $c$ so với phần còn lại:
 
-        $$
-        log\\_odds(t,c) = \\log P(t\\mid c) - \\log P(t\\mid \\neg c)
-        $$
+$$
+log\\_odds(t,c) = \\log P(t\\mid c) - \\log P(t\\mid \\neg c)
+$$
 
-        - log-odds càng cao: token càng “đặc trưng”, giúp phân biệt mạnh cho lớp đó.
-        - $P(t\\mid \\neg c)$ được tính bằng cách trộn các lớp còn lại theo prior để tổng quát.
+- log-odds càng cao: token càng “đặc trưng”, giúp phân biệt mạnh cho lớp đó.
+- $P(t\\mid \\neg c)$ được tính bằng cách trộn các lớp còn lại theo prior để tổng quát.
                 """
             )
 
@@ -936,8 +918,6 @@ $$
                 unsafe_allow_html=True,
             )
 
-
-        # -------- Tab 4
         with tab4:
             pred_id = int(analysis["pred_id"])
             pred_name = analysis["pred_name"]
@@ -1011,11 +991,10 @@ $$
 
                 st.markdown(
                     """
-            Cách dùng bảng này để giải thích:
-            - Nếu một token xuất hiện rất nhiều ở một lớp trong train, nó có thể tạo “lexical bias”.
-            - Khi mô hình đoán sai, thường thấy token “kéo” về lớp sai vì token đó có phân bố nghiêng trong train.
+Cách dùng bảng này để giải thích:
+- Nếu một token xuất hiện rất nhiều ở một lớp trong train, nó có thể tạo “lexical bias”.
+- Khi mô hình đoán sai, thường thấy token “kéo” về lớp sai vì token đó có phân bố nghiêng trong train.
                     """
                 )
-
 
     st.markdown('</div>', unsafe_allow_html=True)
